@@ -5,6 +5,7 @@ LIB DEPENDENCIES  ; "Download ZIP" -> "Extract" -> place in "~/Arduino/libraries
  - https://github.com/wemos/WEMOS_Motor_Shield_Arduino_Library
  - https://github.com/gioblu/PJON
  - https://github.com/nRF24/RF24/releases
+ - https://github.com/Links2004/arduinoWebSockets
 
 
 boards :

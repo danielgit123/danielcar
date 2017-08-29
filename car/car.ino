@@ -1,279 +1,206 @@
+#define MOTO_DRIVER_I2C_ADDR 0x30
+#define MOTO_DRIVER_PWM_FREQ 1000
 
-/*
-* Getting Started example sketch for nRF24L01+ radios
-* This is a very basic example of how to send data from one node to another
-* Updated: Dec 2014 by TMRh20
-*/
+#define MAX_MOTOR_SPEED 100
 
-#include <SPI.h>
-#include "RF24.h"
 
-/****************** User Config ***************************/
-/***      Set this radio as radio number 0 or 1         ***/
-bool radioNumber = 1;
 
-/* Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8 */
-// RF24 radio(D2,D8);
-RF24 radio(D8,D2);
-/**********************************************************/
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
+#include <WebSocketsServer.h>
+#include <Hash.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 
-byte addresses[][6] = {"1Node","2Node"};
 
-// Used to control whether this node is sending or receiving
-bool role = 0;
+#include "WEMOS_Motor.h"
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println(F("RF24/examples/GettingStarted"));
-  Serial.println(F("*** PRESS 'T' to begin transmitting to the other node"));
+Motor M1(MOTO_DRIVER_I2C_ADDR,_MOTOR_A, MOTO_DRIVER_PWM_FREQ);//Motor A
+Motor M2(MOTO_DRIVER_I2C_ADDR,_MOTOR_B, MOTO_DRIVER_PWM_FREQ);//Motor B
 
-  radio.begin();
 
-  // Set the PA Level low to prevent power supply related issues since this is a
- // getting_started sketch, and the likelihood of close proximity of the devices. RF24_PA_MAX is default.
-  radio.setPALevel(RF24_PA_MAX);
+ESP8266WebServer server(80);
+WebSocketsServer webSocket = WebSocketsServer(81);
 
-  // Open a writing and reading pipe on each radio, with opposite addresses
-  if(radioNumber){
-    radio.openWritingPipe(addresses[1]);
-    radio.openReadingPipe(1,addresses[0]);
-  }else{
-    radio.openWritingPipe(addresses[0]);
-    radio.openReadingPipe(1,addresses[1]);
-  }
+#define CAR_STEP_MAX  3
+static const char PROGMEM INDEX_HTML[] = R"rawliteral(
 
-  // Start the radio listening for data
-  radio.startListening();
+<!DOCTYPE html>
+<html>
+<head>
+<meta name = "viewport" content = "width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0">
+<title>ESP8266 WebSocket Car Remote</title>
+<script>
+var websock;
+function start() {
+  websock = new WebSocket('ws://' + window.location.hostname + ':81/');
+  websock.onopen = function(evt) { console.log('websock open'); };
+  websock.onclose = function(evt) { console.log('websock close'); };
+  websock.onerror = function(evt) { console.log(evt); };
+  websock.onmessage = function(evt) {
+    console.log(evt);
+  };
+}
+function updCar() {
+ var cstr = document.getElementById('left').value + "_" + document.getElementById('right').value
+ console.log('CAR: ' + cstr);
+ websock.send(cstr);
+}
+</script>
+<style >
+input[type=range][orient=vertical]
+{
+    writing-mode: bt-lr; /* IE */
+    -webkit-appearance: slider-vertical; /* WebKit */
+    width: 8px;
+    height: 75vh;
+    padding: 0 15vh;
+}
+input[type=range]::-webkit-slider-thumb, ::-moz-range-thumb, ::-ms-thumb {
+    -webkit-appearance: none;
+    background-color: #666;
+    width: 40px;
+    height: 40px;
+ }
+</style>
+</head>
+<body onload="javascript:start();">
+<div style="width: 100%; overflow: hidden;">
+    <div style="width: 30%; float: left;">
+<input oninput="updCar();" type="range" name="left" id="left" value="0" min="-3" max="3" orient="vertical">
+	</div>
+    <div align="right">
+<input oninput="updCar();" type="range" name="right" id="right" value="0" min="-3" max="3" orient="vertical" >
+	</div>
+</div>
+
+</body>
+</html>
+
+)rawliteral";
+
+
+bool ld ;
+bool rd ;
+int lv ;
+int rv ;
+void setWheels(int lw, int rw)
+{
+	ld = lw>0?false:true ;
+	rd = rw>0?true:false ;
+	lv =  map(abs(lw) , 0 , CAR_STEP_MAX ,0,MAX_MOTOR_SPEED)  ;
+	rv =  map(abs(rw) , 0 , CAR_STEP_MAX ,0,MAX_MOTOR_SPEED)  ;
+
+
+	Serial.printf("Left  %u %u \n" ,ld,lv);
+	Serial.printf("Right %u %u \n" ,rd,rv);
 }
 
-void loop() {
 
-
-/****************** Ping Out Role ***************************/
-if (role == 1)  {
-
-    radio.stopListening();                                    // First, stop listening so we can talk.
-
-
-    Serial.println(F("Now sending"));
-
-    unsigned long start_time = micros();                             // Take the time, and send it.  This will block until complete
-     if (!radio.write( &start_time, sizeof(unsigned long) )){
-       Serial.println(F("failed"));
-     }
-
-    radio.startListening();                                    // Now, continue listening
-
-    unsigned long started_waiting_at = micros();               // Set up a timeout period, get the current microseconds
-    boolean timeout = false;                                   // Set up a variable to indicate if a response was received or not
-
-    while ( ! radio.available() ){                             // While nothing is received
-      if (micros() - started_waiting_at > 200000 ){            // If waited longer than 200ms, indicate timeout and exit while loop
-          timeout = true;
-          break;
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length)
+{
+  Serial.printf("webSocketEvent(%d, %d, ...)\r\n", num, type);
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\r\n", num);
+      break;
+    case WStype_CONNECTED:
+      {
+        IPAddress ip = webSocket.remoteIP(num);
+        Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\r\n", num, ip[0], ip[1], ip[2], ip[3], payload);
       }
-    }
+      break;
+    case WStype_TEXT:
+		Serial.printf("[%u] get Text: %s\r\n", num, payload);
 
-    if ( timeout ){                                             // Describe the results
-        Serial.println(F("Failed, response timed out."));
-    }else{
-        unsigned long got_time;                                 // Grab the response, compare, and send to debugging spew
-        radio.read( &got_time, sizeof(unsigned long) );
-        unsigned long end_time = micros();
+		String payloadString=(const char *)payload;
+		byte separator=payloadString.indexOf('_');
+		String ls=payloadString.substring(0,separator);
+		String rs=payloadString.substring(separator+1);
+		setWheels(ls.toInt(),rs.toInt()) ;
 
-        // Spew it
-        Serial.print(F("Sent "));
-        Serial.print(start_time);
-        Serial.print(F(", Got response "));
-        Serial.print(got_time);
-        Serial.print(F(", Round-trip delay "));
-        Serial.print(end_time-start_time);
-        Serial.println(F(" microseconds"));
-    }
+      break;
 
-    // Try again 1s later
-    delay(1000);
   }
+}
 
+void handleRoot()
+{
+  server.send_P(200, "text/html", INDEX_HTML);
+}
 
-
-/****************** Pong Back Role ***************************/
-
-  if ( role == 0 )
-  {
-    unsigned long got_time;
-
-    if( radio.available()){
-                                                                    // Variable for the received timestamp
-      while (radio.available()) {                                   // While there is data ready
-        radio.read( &got_time, sizeof(unsigned long) );             // Get the payload
-      }
-
-      radio.stopListening();                                        // First, stop listening so we can talk
-      radio.write( &got_time, sizeof(unsigned long) );              // Send the final one back.
-      radio.startListening();                                       // Now, resume listening so we catch the next packets.
-      Serial.print(F("Sent response "));
-      Serial.println(got_time);
-   }
- }
-
-
-
-
-/****************** Change Roles via Serial Commands ***************************/
-
-  if ( Serial.available() )
-  {
-    char c = toupper(Serial.read());
-    if ( c == 'T' && role == 0 ){
-      Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
-      role = 1;                  // Become the primary transmitter (ping out)
-
-   }else
-    if ( c == 'R' && role == 1 ){
-      Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
-       role = 0;                // Become the primary receiver (pong back)
-       radio.startListening();
-
-    }
+void handleNotFound()
+{
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET)?"GET":"POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i=0; i<server.args(); i++){
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
+  server.send(404, "text/plain", message);
+}
 
 
-} // Loop
+IPAddress local_IP(192,168,1,1);
+IPAddress gateway(192,168,1,9);
+IPAddress subnet(255,255,255,0);
+void setup()
+{
+//   pinMode(LEDPIN, OUTPUT);
+//   writeLED(false);
+
+  Serial.begin(115200);
+
+  //Serial.setDebugOutput(true);
+
+  Serial.println();
+
+  Serial.print("Setting soft-AP configuration ... ");
+  Serial.println(WiFi.softAPConfig(local_IP, gateway, subnet) ? "Ready" : "Failed!");
+
+  Serial.print("Setting soft-AP ... ");
+  Serial.println(WiFi.softAP("daniel-car") ? "Ready" : "Failed!");
+
+  Serial.print("Soft-AP IP address = ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println();
+  Serial.println();
+  Serial.println();
 
 
-// //////////////  DEFINITIONS / CONFIGS  //////////////////////////////////////
+  Serial.print("Connect to http://");
+  Serial.println(WiFi.localIP());
 
-// #define RECEIVER_PIN 12
-// #define OS_GAIN_REFRESH_DELAY 0
-// /* Gain refresh time of SRX882 module is around 100 milliseconds.
-//    If only one pair of SRX and STX are used to connect 2 devices in SIMPLEX
-//    mode, there is no need to refresh receiver's gain, being communication
-//    mono-directional. */
+  server.on("/", handleRoot);
+  server.onNotFound(handleNotFound);
 
-// #define MOTO_DRIVER_I2C_ADDR 0x30
-// #define MOTO_DRIVER_PWM_FREQ 1000
+  server.begin();
 
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
 
-
-// //////////////  INCLUDES  //////////////////////////////////////
-// #include <PJON.h>
-// #include "WEMOS_Motor.h"
-
-
-
-// // <Strategy name> bus(selected device id)
-// PJON<OverSampling> bus(44);
-
-// //Motor shiled I2C Address: 0x30
-// //PWM frequency: 1000Hz(1kHz)
-// Motor M1(MOTO_DRIVER_I2C_ADDR,_MOTOR_A, MOTO_DRIVER_PWM_FREQ);//Motor A
-// Motor M2(MOTO_DRIVER_I2C_ADDR,_MOTOR_B, MOTO_DRIVER_PWM_FREQ);//Motor B
-
-
-// void setup() {
-//   bus.set_communication_mode(PJON_SIMPLEX);
-//   bus.strategy.set_pins(RECEIVER_PIN , PJON_NOT_ASSIGNED);
-//   bus.begin();
-
-//   bus.set_receiver(receiver_function);
-
-//   Serial.begin(115200);
-// };
-
-// void loop() {
-// 	// CAR_CONTROL();
-// 	PJON_RECV();
-// }
-
-
-// void receiver_function(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-//  // Do nothing to avoid affecting speed analysis
-// }
-
-
-// int pwm;
-// void CAR_CONTROL(){
-// 	for (pwm = 20; pwm <= 100; pwm++)
-//   {
-//     M1.setmotor( _CW, pwm);
-//     M2.setmotor(_CW, 100-pwm);
-//     Serial.printf("A:%d%, B:%d%, DIR:CW\r\n", pwm,100-pwm);
-//   }
-
-//   M1.setmotor(_STOP);
-//   M2.setmotor( _STOP);
-//   Serial.println("Motor A&B STOP");
-//   delay(200);
-
-//   for (pwm = 20; pwm <=100; pwm++)
-//   {
-//     M1.setmotor(_CCW, pwm);
-//     M2.setmotor(_CCW, 100-pwm);
-//     Serial.printf("A:%d%, B:%d%, DIR:CCW\r\n", pwm,100-pwm);
-
-//   }
-
-//   M1.setmotor(_STOP);
-//   M2.setmotor( _STOP);
-//   delay(200);
-//   Serial.println("Motor A&B STOP");
-
-//   M1.setmotor(_SHORT_BRAKE);
-//   M2.setmotor( _SHORT_BRAKE);
-//   Serial.println("Motor A&B SHORT BRAKE");
-//   delay(1000);
-
-//   M1.setmotor(_STANDBY);
-//   M2.setmotor( _STANDBY);
-//   Serial.println("Motor A&B STANDBY");
-//   delay(1000);
-// }
+void loop()
+{
+  webSocket.loop();
+  server.handleClient();
 
 
 
-// float test;
-// float mistakes;
-// int busy;
-// int fail;
+	if(lv == 0)
+		M1.setmotor(_STOP);
+	else
+    	M1.setmotor( ld ? _CW : _CCW, lv);
 
-// void PJON_RECV(){
-//   Serial.println("Starting 1 second communication speed test...");
-//   long time = millis();
-//   unsigned int response = 0;
-//   while(millis() - time < 1000) {
-//     response = bus.receive();
-//     if(response == PJON_ACK)
-//       test++;
-//     if(response == PJON_NAK)
-//       mistakes++;
-//     if(response == PJON_BUSY)
-//       busy++;
-//     if(response == PJON_FAIL)
-//       fail++;
-//   }
+	if(rv == 0)
+		M2.setmotor(_STOP);
+	else
+		M2.setmotor( rd ? _CW : _CCW, rv);
 
-//   Serial.print("Absolute com speed: ");
-//   Serial.print(test * 25);
-//   Serial.println("B/s");
-//   Serial.print("Practical bandwidth: ");
-//   Serial.print(test * 20);
-//   Serial.println("B/s");
-//   Serial.print("Packets sent: ");
-//   Serial.println(test);
-//   Serial.print("Mistakes (error found with CRC) ");
-//   Serial.println(mistakes);
-//   Serial.print("Fail (no answer from receiver) ");
-//   Serial.println(fail);
-//   Serial.print("Busy (Channel is busy or affected by interference) ");
-//   Serial.println(busy);
-//   Serial.print("Accuracy: ");
-//   Serial.print(100 - (100 / (test / mistakes)));
-//   Serial.println(" %");
-//   Serial.println(" --------------------- ");
-
-//   test = 0;
-//   mistakes = 0;
-//   busy = 0;
-//   fail = 0;
-// };
+}
